@@ -1,0 +1,227 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Auto Scaling Apache Web Server with CPU-based scaling'
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair
+  VpcId:
+    Description: ID of your existing VPC
+    Type: AWS::EC2::VPC::Id
+  PublicSubnet:
+    Description: Public subnet for the load balancer
+    Type: AWS::EC2::Subnet::Id
+  PrivateSubnet:
+    Description: Private subnet for the ASG instances
+    Type: AWS::EC2::Subnet::Id
+
+Resources:
+  # Security Groups
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP access
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from ALB and SSH from anywhere
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !GetAtt LoadBalancerSecurityGroup.GroupId
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  # IAM Role for EC2 Instances
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ec2.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2Role
+
+  # Launch Template
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: WebServerLaunchTemplate
+      LaunchTemplateData:
+        ImageId: ami-0c55b159cbfafe1f0  # Amazon Linux 2 AMI (update if needed)
+        InstanceType: t2.micro
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !GetAtt InstanceSecurityGroup.GroupId
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            # Install Apache and stress tool
+            yum update -y
+            yum install -y httpd stress
+            systemctl start httpd
+            systemctl enable httpd
+            
+            # Create HTML page with instance info and CPU stress button
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            IP_ADDRESS=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+            
+            cat <<EOF > /var/www/html/index.html
+            <html>
+            <head>
+                <title>Auto Scaling Demo</title>
+                <style>
+                    body { font-family: Arial, sans-serif; text-align: center; margin-top: 50px; }
+                    button { padding: 10px 20px; font-size: 16px; margin-top: 20px; }
+                </style>
+            </head>
+            <body>
+                <h1>Hello from $IP_ADDRESS / $INSTANCE_ID</h1>
+                <p>This is an auto-scaled Apache web server instance.</p>
+                <button onclick="stressCPU()">Stress CPU (Trigger Scaling)</button>
+                <script>
+                    function stressCPU() {
+                        fetch('/stress-cpu', { method: 'POST' })
+                            .then(response => alert('CPU stress initiated! Scaling may occur if utilization exceeds 50%'))
+                            .catch(error => alert('Error: ' + error));
+                    }
+                </script>
+            </body>
+            </html>
+            EOF
+            
+            # Create endpoint for CPU stress
+            cat <<EOF > /var/www/html/stress-cpu
+            #!/bin/bash
+            echo "Content-type: text/html"
+            echo ""
+            echo "<html><body>"
+            echo "Starting CPU stress test for 60 seconds..."
+            echo "</body></html>"
+            nohup stress --cpu 2 --timeout 60 >/dev/null 2>&1 &
+            EOF
+            
+            chmod +x /var/www/html/stress-cpu
+            ln -s /var/www/html/stress-cpu /var/www/cgi-bin/stress-cpu
+
+  # Auto Scaling Group
+  WebServerASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: WebServerASG
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 1
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet
+      TargetGroupARNs:
+        - !Ref WebServerTargetGroup
+      Cooldown: 300
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+
+  # Scaling Policy
+  ScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref WebServerASG
+      Cooldown: 60
+      ScalingAdjustment: 1
+
+  # CloudWatch Alarm for Scaling Up
+  CPUAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Alarm if CPU too high or metric disappears indicating instance is down
+      AlarmActions:
+        - !Ref ScaleUpPolicy
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WebServerASG
+
+  # Load Balancer Resources
+  WebServerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: WebServerTargetGroup
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+
+  WebServerLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: WebServerLoadBalancer
+      Subnets:
+        - !Ref PublicSubnet
+      SecurityGroups:
+        - !GetAtt LoadBalancerSecurityGroup.GroupId
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+
+  WebServerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebServerTargetGroup
+      LoadBalancerArn: !Ref WebServerLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+Outputs:
+  LoadBalancerDNS:
+    Description: Load Balancer DNS Name
+    Value: !GetAtt WebServerLoadBalancer.DNSName
+    Export:
+      Name: LoadBalancerDNS
