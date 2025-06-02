@@ -1,0 +1,9 @@
+template-file-path: autoscaling-lab.yaml
+parameters:
+  KeyName: ogidiKeyPair
+  PrivateSubnet1: subnet-0a07c23e3237bca01
+  PrivateSubnet2: subnet-05dee8b9bdcb03542
+  VpcId: vpc-0e5dffa193a60ecc4
+  PublicSubnet2: subnet-0d58f0033b76baee1
+  PublicSubnet1: subnet-02b1687a7791189aa
+tags: {}
